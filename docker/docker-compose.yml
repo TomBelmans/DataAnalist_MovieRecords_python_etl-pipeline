@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  movierecordsdw:
+    image: postgres:latest
+    container_name: MovieRecordsDW
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: <mijn passwoord>
+      POSTGRES_DB: MovieRecordsDW
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/var/lib/postgresql/data/pg_hba.conf
+    networks:
+      - mynetwork
+
+volumes:
+  postgres_data:
+
+networks:
+  mynetwork:
+    driver: bridge
