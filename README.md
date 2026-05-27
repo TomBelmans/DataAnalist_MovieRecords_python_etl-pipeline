@@ -79,7 +79,7 @@ movieRecords/
 ├── sql/
 │   ├── create_tables.sql   # Eenmalig uitvoeren om het schema aan te maken
 │   ├── truncate_tables.sql
-│   └── erd.png             # Entity Relationship Diagram
+│   └── erd.png             # Afbeelding van het Entity Relationship Diagram, gegenereerd in pgAdmin4
 ├── docker/
 │   ├── docker-compose.yml
 │   ├── pg_hba.conf         # PostgreSQL authenticatieconfiguratie
@@ -88,7 +88,7 @@ movieRecords/
 ├── main.py                 # Entry point / CLI-orchestrator
 ├── check_db.py             # Verbindings- en schemaverificatie
 ├── requirements.txt
-└── .env                    # Credentials (niet committen)
+└── .env                    # Credentials (deze moet zelf aangemaakt worden, gitignored)
 ```
 
 ---
@@ -116,19 +116,19 @@ TSV-bestanden gebruiken tab als scheidingsteken; `\N` staat voor NULL. Gecomprim
 **Vereisten:** Python 3.11+, PostgreSQL (lokaal via Docker of extern)
 
 ```powershell
-cd c:\School\python\movieRecords
+cd c:\<bestandslocatie>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-In Cursor/VS Code: kies als interpreter `.venv\Scripts\python.exe`.
+In de IDE: kies als interpreter `.venv\Scripts\python.exe`.
 
 ---
 
 ## Configuratie
 
-Maak een `.env` in de projectmap (commit deze nooit naar git):
+Maak een `.env` in de root van je projectmap:
 
 ```env
 DB_HOST=localhost
