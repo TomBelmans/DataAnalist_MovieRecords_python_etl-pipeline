@@ -1,22 +1,28 @@
-version: '3.8'
-
 services:
   movierecordsdw:
     image: postgres:latest
     container_name: MovieRecordsDW
+    env_file:
+      - ../.env
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: <mijn passwoord>
-      POSTGRES_DB: MovieRecordsDW
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf
     command: >
       postgres
       -c config_file=/etc/postgresql/postgresql.conf
-      -c hba_file=/var/lib/postgresql/data/pg_hba.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - mynetwork
 

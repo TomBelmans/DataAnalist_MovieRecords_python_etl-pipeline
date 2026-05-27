@@ -1,5 +1,5 @@
 -- ============================================================
--- MovieRecordsDW – PostgreSQL DDL voor Supabase
+-- MovieRecordsDW – PostgreSQL DDL voor PostgreSQL
 -- Aanmaak volgorde respecteert FK-afhankelijkheden
 -- ============================================================
 
