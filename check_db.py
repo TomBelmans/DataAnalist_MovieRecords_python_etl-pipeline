@@ -17,43 +17,43 @@ import argparse
 import sys
 from collections import defaultdict
 
-import psycopg2
+import pyodbc
 
 from pipeline import config as cfg
+from pipeline.load import get_connection
 
 
 def connect():
     """
-    Maakt een PostgreSQL-verbinding op basis van pipeline/config.py (.env),
+    Maakt een SQL Server-verbinding op basis van pipeline/config.py (.env),
     valideert dat host en wachtwoord aanwezig zijn, en zet autocommit aan.
 
     Returns:
-        Tuple (conn, schema): open psycopg2-verbinding en het DW-schema
+        Tuple (conn, schema): open pyodbc-verbinding en het DW-schema
         (standaard 'MovieRecordsDW' via DB_SCHEMA in .env).
     """
     cfg.validate_config()
-    conn = psycopg2.connect(**cfg.DB_CONFIG)
+    conn = get_connection(cfg.DB_CONFIG)
     conn.autocommit = True
     return conn, cfg.DB_SCHEMA
 
 
 def fetch_schemas(cur) -> list[str]:
     """
-    Deze methode haalt alle gebruikersschema's op van de database (zonder systeemschema's) en f pg_catalog, information_schema en interne pg_*-schema's eruit, zodat alleen relevante schema's zoals MovieRecordsDW en public zichtbaar zijn.
-
-    Args:
-        cur: Actieve databasecursor.
-
-    Returns:
-        Gesorteerde lijst met schemanamen.
+    Haalt alle gebruikersschema's op van de database (zonder systeemschema's).
     """
     cur.execute(
         """
-        SELECT schema_name
-        FROM information_schema.schemata
-        WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-          AND schema_name NOT LIKE 'pg_%%'
-        ORDER BY schema_name
+        SELECT name
+        FROM sys.schemas
+        WHERE name NOT IN (
+            'sys', 'guest', 'INFORMATION_SCHEMA',
+            'db_owner', 'db_accessadmin', 'db_securityadmin',
+            'db_ddladmin', 'db_backupoperator',
+            'db_datareader', 'db_datawriter',
+            'db_denydatareader', 'db_denydatawriter'
+        )
+        ORDER BY name
         """
     )
     return [row[0] for row in cur.fetchall()]
@@ -61,20 +61,13 @@ def fetch_schemas(cur) -> list[str]:
 
 def fetch_tables(cur, schema: str) -> list[str]:
     """
-    Deze methode haalt alle basistabellen op binnen het opgegeven schema.
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam (bv. 'MovieRecordsDW').
-
-    Returns:
-        Gesorteerde lijst met tabelnamen (bv. ['DimDate', 'DimMovie', ...]).
+    Haalt alle basistabellen op binnen het opgegeven schema.
     """
     cur.execute(
         """
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema = %s
+        WHERE table_schema = ?
           AND table_type = 'BASE TABLE'
         ORDER BY table_name
         """,
@@ -85,18 +78,7 @@ def fetch_tables(cur, schema: str) -> list[str]:
 
 def fetch_columns(cur, schema: str, table: str) -> list[dict]:
     """
-    Deze methode haalt alle kolomdefinities op voor één tabel via information_schema.
-
-    Per kolom worden naam, positie, datatype, nullable-vlag en default-waarde
-    opgeslagen. Het datatype wordt leesbaar gemaakt via _format_type().
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam.
-        table:  Tabelnaam.
-
-    Returns:
-        Lijst van dicts met keys: name, position, type, nullable, default.
+    Haalt alle kolomdefinities op voor één tabel via information_schema.
     """
     cur.execute(
         """
@@ -104,84 +86,61 @@ def fetch_columns(cur, schema: str, table: str) -> list[dict]:
             column_name,
             ordinal_position,
             data_type,
-            udt_name,
             character_maximum_length,
             numeric_precision,
             numeric_scale,
             is_nullable,
             column_default
         FROM information_schema.columns
-        WHERE table_schema = %s
-          AND table_name = %s
+        WHERE table_schema = ?
+          AND table_name = ?
         ORDER BY ordinal_position
         """,
         (schema, table),
     )
     cols = []
     for row in cur.fetchall():
-        name, pos, dtype, udt, char_len, num_prec, num_scale, nullable, default = row
-        type_label = _format_type(dtype, udt, char_len, num_prec, num_scale)
+        name, pos, dtype, char_len, num_prec, num_scale, nullable, default = row
+        type_label = _format_type(dtype, char_len, num_prec, num_scale)
         cols.append(
             {
-                "name": name,
+                "name":     name,
                 "position": pos,
-                "type": type_label,
+                "type":     type_label,
                 "nullable": nullable == "YES",
-                "default": default,
+                "default":  default,
             }
         )
     return cols
 
 
-def _format_type(dtype, udt, char_len, num_prec, num_scale) -> str:
-    """
-   Deze methode zet ruwe PostgreSQL-typen om naar een leesbaar label voor de terminal.
-
-    Combineert information_schema.data_type en udt_name (bijv. int4 → INTEGER,
-    serial → INTEGER (serial), varchar → CHARACTER VARYING(10)).
-
-    Args:
-        dtype:    Algemeen datatype (information_schema).
-        udt:      Underlying type name (PostgreSQL-specifiek).
-        char_len: Maximale lengte voor teksttypes.
-        num_prec: Precisie voor numeric.
-        num_scale: Schaal voor numeric.
-
-    Returns:
-        Geformatteerde typestring voor weergave.
-    """
-    if udt in ("int4", "serial"):
-        return "INTEGER (serial)" if udt == "serial" else "INTEGER"
-    if udt == "int8":
-        return "BIGINT (bigserial)" if dtype == "bigint" else "BIGINT"
-    if udt == "bool":
-        return "BOOLEAN"
-    if udt == "text":
-        return "TEXT"
-    if udt in ("varchar", "bpchar"):
-        length = char_len or "?"
+def _format_type(dtype: str, char_len, num_prec, num_scale) -> str:
+    """Zet SQL Server-typen om naar een leesbaar label voor de terminal."""
+    dtype = dtype.lower()
+    if dtype in ("int", "integer"):
+        return "INT"
+    if dtype == "bigint":
+        return "BIGINT"
+    if dtype == "bit":
+        return "BIT"
+    if dtype in ("nvarchar", "varchar"):
+        length = "MAX" if char_len == -1 else (char_len or "?")
         return f"{dtype.upper()}({length})"
-    if udt == "numeric":
+    if dtype in ("nchar", "char"):
+        return f"{dtype.upper()}({char_len or '?'})"
+    if dtype == "numeric":
         return f"NUMERIC({num_prec},{num_scale})"
-    if udt in ("timestamp", "timestamptz"):
+    if dtype in ("datetime2", "datetime", "smalldatetime"):
         return dtype.upper()
-    if udt == "date":
+    if dtype == "date":
         return "DATE"
-    return f"{dtype} ({udt})"
+    if dtype == "text":
+        return "TEXT"
+    return dtype.upper()
 
 
 def fetch_primary_keys(cur, schema: str, table: str) -> list[str]:
-    """
-    Deze methode haalt de kolomnamen op die deel uitmaken van de primary key van een tabel.
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam.
-        table:  Tabelnaam.
-
-    Returns:
-        Lijst van PK-kolomnamen in constraint-volgorde (bv. ['movie_sk']).
-    """
+    """Haalt de kolomnamen op die deel uitmaken van de primary key van een tabel."""
     cur.execute(
         """
         SELECT kcu.column_name
@@ -190,8 +149,8 @@ def fetch_primary_keys(cur, schema: str, table: str) -> list[str]:
           ON tc.constraint_schema = kcu.constraint_schema
          AND tc.constraint_name = kcu.constraint_name
         WHERE tc.constraint_type = 'PRIMARY KEY'
-          AND tc.table_schema = %s
-          AND tc.table_name = %s
+          AND tc.table_schema = ?
+          AND tc.table_name = ?
         ORDER BY kcu.ordinal_position
         """,
         (schema, table),
@@ -200,20 +159,7 @@ def fetch_primary_keys(cur, schema: str, table: str) -> list[str]:
 
 
 def fetch_foreign_keys(cur, schema: str, table: str) -> dict[str, list[str]]:
-    """
-    Deze methode haalt alle foreign key-relaties op voor één tabel.
-
-    Per lokale kolom wordt bijgehouden naar welke tabel.kolom de FK verwijst,
-    bijv. dimMovieKey → MovieRecordsDW.DimMovie("movie_sk").
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam.
-        table:  Tabelnaam.
-
-    Returns:
-        Dict {kolomnaam: [referentie-strings]} — een kolom kan meerdere FK's hebben.
-    """
+    """Haalt alle foreign key-relaties op voor één tabel."""
     cur.execute(
         """
         SELECT
@@ -229,8 +175,8 @@ def fetch_foreign_keys(cur, schema: str, table: str) -> dict[str, list[str]]:
           ON ccu.constraint_schema = tc.constraint_schema
          AND ccu.constraint_name = tc.constraint_name
         WHERE tc.constraint_type = 'FOREIGN KEY'
-          AND tc.table_schema = %s
-          AND tc.table_name = %s
+          AND tc.table_schema = ?
+          AND tc.table_name = ?
         ORDER BY kcu.column_name
         """,
         (schema, table),
@@ -242,52 +188,28 @@ def fetch_foreign_keys(cur, schema: str, table: str) -> dict[str, list[str]]:
 
 
 def print_header(title: str) -> None:
-    """
-    Print een visuele sectiekop in de terminal (72 tekens breed).
-
-    Args:
-        title: Titel van de sectie (bv. 'VERBINDING', 'TABELLEN IN SCHEMA ...').
-    """
     line = "=" * 72
     print(f"\n{line}\n  {title}\n{line}")
 
 
 def print_connection_info(conn, schema: str) -> None:
-    """
-    Deze methode haalt toont verbindingsdetails: host uit .env plus live info van de server.
-
-    Vraagt aan PostgreSQL: huidige database, gebruiker, server-IP en versie.
-    Legt uit dat 'postgres' de databasenaam is en schema het DW-logisch model.
-
-    Args:
-        conn:   Open psycopg2-verbinding.
-        schema: Doelschema (MovieRecordsDW).
-    """
+    """Toont verbindingsdetails: host uit .env plus live info van de server."""
     print_header("VERBINDING")
     with conn.cursor() as cur:
-        cur.execute("SELECT current_database(), current_user, inet_server_addr(), version()")
-        db, user, host, version = cur.fetchone()
+        cur.execute("SELECT DB_NAME(), SYSTEM_USER, @@SERVERNAME, @@VERSION")
+        db, user, server_name, version = cur.fetchone()
 
     print(f"  Host                : {cfg.DB_CONFIG['host']}")
     print(f"  Poort               : {cfg.DB_CONFIG['port']}")
-    print(f"  PostgreSQL database : {db}")
+    print(f"  SQL Server database : {db}")
     print(f"  DW-schema (logisch) : {schema}       (hier staan je DW-tabellen)")
     print(f"  Gebruiker           : {user}")
-    print(f"  Server IP           : {host or '(via pooler)'}")
-    print(f"  PostgreSQL          : {version.split(',')[0]}")
+    print(f"  Server              : {server_name or '(via Docker)'}")
+    print(f"  Versie              : {version.splitlines()[0]}")
 
 
 def print_schemas(cur, target_schema: str) -> None:
-    """
-    Deze methode haalt alle beschikbare schema's op en toont ze, en markeert het doelschema (MovieRecordsDW).
-
-    Geeft een waarschuwing als het doelschema niet bestaat (create_tables.sql nog
-    niet uitgevoerd).
-
-    Args:
-        cur:            Actieve databasecursor.
-        target_schema:  Schema dat je wilt gebruiken voor de ETL.
-    """
+    """Toont alle beschikbare schema's en markeert het doelschema."""
     schemas = fetch_schemas(cur)
     print_header("BESCHIKBARE SCHEMA'S")
     for s in schemas:
@@ -295,20 +217,11 @@ def print_schemas(cur, target_schema: str) -> None:
         print(f"  - {s}{marker}")
     if target_schema not in schemas:
         print(f"\n  [!] Schema '{target_schema}' bestaat niet op deze server.")
-        print("    Voer sql/create_tables.sql uit op de PostgreSQL-server.")
+        print("    Voer sql/create_tables.sql uit op de SQL Server.")
 
 
 def print_tables(cur, schema: str) -> list[str]:
-    """
-    Deze methode toont een genummerde lijst van alle tabellen in het DW-schema.
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam.
-
-    Returns:
-        Lijst met tabelnamen (leeg als er geen tabellen zijn).
-    """
+    """Toont een genummerde lijst van alle tabellen in het DW-schema."""
     tables = fetch_tables(cur, schema)
     print_header(f"TABELLEN IN SCHEMA '{schema}'")
     if not tables:
@@ -321,20 +234,10 @@ def print_tables(cur, schema: str) -> list[str]:
 
 
 def print_table_details(cur, schema: str, table: str) -> None:
-    """
-    Deze methode toont per kolom: datatype, NULL/NOT NULL, primary key en foreign keys.
-
-    Combineert fetch_columns, fetch_primary_keys en fetch_foreign_keys in
-    één overzichtelijke tabel in de terminal.
-
-    Args:
-        cur:    Actieve databasecursor.
-        schema: Schemanaam.
-        table:  Tabelnaam.
-    """
+    """Toont per kolom: datatype, NULL/NOT NULL, primary key en foreign keys."""
     columns = fetch_columns(cur, schema, table)
-    pks = set(fetch_primary_keys(cur, schema, table))
-    fks = fetch_foreign_keys(cur, schema, table)
+    pks     = set(fetch_primary_keys(cur, schema, table))
+    fks     = fetch_foreign_keys(cur, schema, table)
 
     print_header(f"TABEL: {schema}.{table}")
     if not columns:
@@ -347,11 +250,11 @@ def print_table_details(cur, schema: str, table: str) -> None:
     print(f"  {'-' * col_w}  {'-' * 22}  {'-' * 6}  {'-' * 4}  {'-' * 30}")
 
     for col in columns:
-        name = col["name"]
+        name     = col["name"]
         null_txt = "NULL" if col["nullable"] else "NOT NULL"
-        pk_txt = "PK" if name in pks else ""
-        fk_txt = ", ".join(fks.get(name, [])) or "-"
-        default = f"  default={col['default']}" if col["default"] else ""
+        pk_txt   = "PK" if name in pks else ""
+        fk_txt   = ", ".join(fks.get(name, [])) or "-"
+        default  = f"  default={col['default']}" if col["default"] else ""
         print(
             f"  {name:<{col_w}}  {col['type']:<22}  {null_txt:<6}  {pk_txt:<4}  {fk_txt}{default}"
         )
@@ -359,10 +262,7 @@ def print_table_details(cur, schema: str, table: str) -> None:
 
 def run(table_filter: str | None = None) -> int:
     """
-    Deze methode voert de volledige verificatie uit en geef een exitcode terug.
-
-    Stappen: verbinden → verbindingsinfo → schema's → tabellen → kolomdetails
-    (alle tabellen of alleen table_filter). Sluit de verbinding altijd af.
+    Voert de volledige verificatie uit en geeft een exitcode terug.
 
     Args:
         table_filter: Optionele tabelnaam (bv. 'DimMovie'). None = alle tabellen.
@@ -410,14 +310,8 @@ def run(table_filter: str | None = None) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    Deze methode verwerkt command-line argumenten (--table voor filtering op één tabel).
-
-    Returns:
-        argparse.Namespace met optioneel veld 'table'.
-    """
     parser = argparse.ArgumentParser(
-        description="Controleer de PostgreSQL-verbinding en toon MovieRecordsDW-metadata."
+        description="Controleer de SQL Server-verbinding en toon MovieRecordsDW-metadata."
     )
     parser.add_argument(
         "--table",

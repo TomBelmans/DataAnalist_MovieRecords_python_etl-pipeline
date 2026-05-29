@@ -1,6 +1,6 @@
 # MovieRecords ETL
 
-Python-implementatie van de **MovieRecords** datawarehouse-pipeline. Laadt IMDb-stagingbestanden in een PostgreSQL-datawarehouse — dezelfde laadvolgorde en SCD-2-logica als het oorspronkelijke SSIS-pakket (`movierecords_initLoad`).
+Python-implementatie van de **MovieRecords** datawarehouse-pipeline. Laadt IMDb-stagingbestanden in een SQL Server-datawarehouse — dezelfde laadvolgorde en SCD-2-logica als het oorspronkelijke SSIS-pakket (`movierecords_initLoad`).
 
 ---
 
@@ -9,7 +9,7 @@ Python-implementatie van de **MovieRecords** datawarehouse-pipeline. Laadt IMDb-
 | Onderdeel | Beschrijving |
 |-----------|--------------|
 | **Bron** | Lokale staging-bestanden (TSV/CSV) uit IMDb-datasets |
-| **Doel** | Schema `MovieRecordsDW` op PostgreSQL |
+| **Doel** | Schema `dbo` in database `MovieRecordsDW` op SQL Server 2022 |
 | **Patroon** | ETL: Extract → Transform → Load |
 | **Dimensies** | SCD Type 2 (historiek via `RowStartDate` / `RowEndDate`) |
 | **Feiten** | Truncate-and-reload (`FactRating`, `FactPrincipal`) |
@@ -25,8 +25,8 @@ Python-implementatie van de **MovieRecords** datawarehouse-pipeline. Laadt IMDb-
 ```mermaid
 flowchart LR
     ENV[(".env")]
-    STAGING[("staging/\nTSV · CSV")]
-    DB[("PostgreSQL\nMovieRecordsDW")]
+    STAGING[("Staging/\nTSV · CSV")]
+    DB[("SQL Server\nMovieRecordsDW")]
 
     ENV --> config["config.py\n① .env laden\nverbinding valideren"]
     STAGING --> extract["extract.py\n② bronbestanden inlezen\n→ raw DataFrames"]
@@ -69,7 +69,7 @@ flowchart TD
 ## Projectstructuur
 
 ```
-movieRecords/
+DataAnalist_MovieRecords_python_etl-pipeline/
 ├── pipeline/               # ETL-kernpakket
 │   ├── __init__.py
 │   ├── config.py           # .env laden, DB_CONFIG, validate_config()
@@ -77,18 +77,15 @@ movieRecords/
 │   ├── transform.py        # DataFrames → DW-schema (kolommen, types, FK's)
 │   └── load.py             # SCD-2, statische dims, feit-tabellen, SK-maps
 ├── sql/
-│   ├── create_tables.sql   # Eenmalig uitvoeren om het schema aan te maken
-│   ├── truncate_tables.sql
-│   └── erd.png             # Afbeelding van het Entity Relationship Diagram, gegenereerd in pgAdmin4
+│   ├── create_tables.sql   # Eenmalig uitvoeren om schema + tabellen aan te maken
+│   └── truncate_tables.sql # Alle tabellen leegmaken (optioneel, bij herstart)
 ├── docker/
-│   ├── docker-compose.yml
-│   ├── pg_hba.conf         # PostgreSQL authenticatieconfiguratie
-│   └── postgresql.conf     # PostgreSQL serverconfiguratie
-├── staging/                # Bronbestanden (TSV + CSV, gitignored)
+│   └── docker-compose.yml  # Optionele SQL Server 2022 container (Developer edition)
+├── Staging/                # Bronbestanden (TSV + CSV, gitignored)
 ├── main.py                 # Entry point / CLI-orchestrator
 ├── check_db.py             # Verbindings- en schemaverificatie
 ├── requirements.txt
-└── .env                    # Credentials (deze moet zelf aangemaakt worden, gitignored)
+└── .env                    # Verbindingsinstellingen (gitignored, zelf aanmaken)
 ```
 
 ---
@@ -113,10 +110,10 @@ TSV-bestanden gebruiken tab als scheidingsteken; `\N` staat voor NULL. Gecomprim
 
 ## Installatie
 
-**Vereisten:** Python 3.11+, PostgreSQL (lokaal via Docker of extern)
+**Vereisten:** Python 3.11+, ODBC Driver 17 for SQL Server, SQL Server 2022 (lokaal of via Docker)
 
 ```powershell
-cd c:\<bestandslocatie>
+cd C:\<bestandslocatie>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -128,55 +125,95 @@ In de IDE: kies als interpreter `.venv\Scripts\python.exe`.
 
 ## Configuratie
 
-Maak een `.env` in de root van je projectmap:
+Maak een `.env` in de root van je projectmap. De inhoud hangt af van hoe je verbinding maakt:
+
+### Windows-authenticatie (lokale named instance via Shared Memory)
 
 ```env
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=postgres
-DB_USER=postgres
-DB_PASSWORD=<jouw-wachtwoord>
+DB_HOST=lpc:localhost\SYNTRA_TOM
+DB_PORT=1433
+DB_NAME=MovieRecordsDW
+DB_AUTH=windows
 
 STAGING_DIR=./Staging
-DB_SCHEMA=MovieRecordsDW
 LOG_LEVEL=INFO
 ```
 
+> Het `lpc:`-prefix dwingt het Shared Memory-protocol af. Gebruik dit als TCP/IP uitgeschakeld is op de SQL Server-instance. Werkt alleen op de lokale machine.
+
+### SQL Server-authenticatie (Docker of externe server)
+
+```env
+DB_HOST=localhost
+DB_PORT=1433
+DB_NAME=MovieRecordsDW
+DB_AUTH=sql
+DB_USER=sa
+DB_PASSWORD=<jouw-wachtwoord>
+
+STAGING_DIR=./Staging
+LOG_LEVEL=INFO
+```
+
+### Overzicht variabelen
+
 | Variabele | Verplicht | Standaard | Beschrijving |
 |-----------|-----------|-----------|--------------|
-| `DB_HOST` | **Ja** | — | Hostnaam of IP van de PostgreSQL-server |
-| `DB_PASSWORD` | **Ja** | — | Database-wachtwoord |
-| `DB_PORT` | Nee | `5432` | Poort |
-| `DB_NAME` | Nee | `postgres` | Database-naam |
-| `DB_USER` | Nee | `postgres` | Database-gebruiker |
+| `DB_HOST` | **Ja** | — | Hostnaam, IP of `lpc:localhost\<instance>` voor Shared Memory |
+| `DB_AUTH` | Nee | `sql` | `windows` (Windows-auth) of `sql` (gebruikersnaam + wachtwoord) |
+| `DB_PASSWORD` | Alleen bij `DB_AUTH=sql` | — | SA- of gebruikerswachtwoord |
+| `DB_PORT` | Nee | `1433` | TCP-poort (niet gebruikt bij `lpc:`-verbinding) |
+| `DB_NAME` | Nee | `MovieRecordsDW` | Database-naam |
+| `DB_USER` | Nee | `sa` | Gebruikersnaam (alleen bij `DB_AUTH=sql`) |
 | `STAGING_DIR` | Nee | `./Staging` | Pad naar de staging-bestanden |
-| `DB_SCHEMA` | Nee | `MovieRecordsDW` | PostgreSQL-schema |
+| `DB_SCHEMA` | Nee | `dbo` | SQL Server-schema |
 | `LOG_LEVEL` | Nee | `INFO` | `DEBUG` · `INFO` · `WARNING` · `ERROR` |
 
 ---
 
 ## Database opstarten
 
-### Via Docker
+### Optie A — Lokale SQL Server-instance
+
+Zorg dat de SQL Server-service draait (te controleren via Services of SQL Server Configuration Manager). Als TCP/IP uitgeschakeld is, gebruik dan het `lpc:`-prefix in `DB_HOST` (zie Configuratie hierboven).
+
+Controleer welke protocollen ingeschakeld zijn:
 
 ```powershell
-cd docker
-docker compose up -d
+# TCP/IP status
+Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.<instance>\MSSQLServer\SuperSocketNetLib\Tcp" | Select-Object Enabled
+
+# Shared Memory status
+Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.<instance>\MSSQLServer\SuperSocketNetLib\Sm" | Select-Object Enabled
 ```
 
-Docker laadt automatisch `pg_hba.conf` en `postgresql.conf` als volumes. Wacht tot de container `healthy` is:
+### Optie B — Via Docker (SQL Server 2022 Developer)
 
 ```powershell
-docker compose ps
+docker compose -f docker/docker-compose.yml up -d
 ```
+
+Wacht tot de container `healthy` is:
+
+```powershell
+docker compose -f docker/docker-compose.yml ps
+```
+
+Gebruik voor Docker `DB_AUTH=sql` met het wachtwoord dat je in `.env` instelt als `DB_PASSWORD`.
 
 ### Schema aanmaken
 
-Voer `sql/create_tables.sql` eenmalig uit (bv. via psql, pgAdmin of een andere SQL-client):
+Voer `sql/create_tables.sql` eenmalig uit via `sqlcmd`:
 
 ```powershell
-psql -h localhost -U postgres -d postgres -f sql/create_tables.sql
+# Windows-authenticatie (Shared Memory)
+sqlcmd -S "lpc:localhost\SYNTRA_TOM" -d MovieRecordsDW -E -I -i sql/create_tables.sql
+
+# SQL Server-authenticatie (TCP, bv. Docker)
+sqlcmd -S localhost,1433 -U sa -P <wachtwoord> -d MovieRecordsDW -i sql/create_tables.sql
 ```
+
+> De `-I` vlag is verplicht voor filtered indexes (`QUOTED_IDENTIFIER ON`).
 
 Controleer daarna de verbinding en het schema:
 
@@ -216,11 +253,9 @@ python main.py --tables FactRating
 | Package | Versie | Gebruik |
 |---------|--------|---------|
 | `pandas` | 3.0.3 | DataFrames en transformaties |
-| `psycopg2-binary` | 2.9.12 | PostgreSQL-verbinding |
+| `numpy` | 2.4.6 | Type-conversies bij het laden (integers, floats, booleans) |
+| `pyodbc` | 5.3.0 | SQL Server-verbinding via ODBC Driver 17 |
 | `python-dotenv` | 1.2.2 | `.env` laden |
-| `pycountry` | 26.2.16 | Landmetadata voor DimCountry |
-| `requests` | 2.34.2 | (niet actief in gebruik) |
-| `tqdm` | 4.67.3 | (niet actief in gebruik) |
 
 ---
 
@@ -229,9 +264,11 @@ python main.py --tables FactRating
 | Probleem | Oplossing |
 |----------|-----------|
 | `Import "pandas" could not be resolved` | Activeer `.venv` en selecteer de juiste Python-interpreter in je editor |
+| Verbinding geweigerd (10061) | TCP/IP is uitgeschakeld op de instance; gebruik `lpc:localhost\<instance>` voor Shared Memory, of schakel TCP in via SQL Server Configuration Manager (`C:\Windows\SysWOW64\SQLServerManager16.msc`) |
+| SQL Server Browser gestopt | Vereist voor named instances via TCP; niet nodig bij Shared Memory (`lpc:`-prefix) |
+| Schema `MovieRecordsDW` bestaat niet | Voer `sql/create_tables.sql` uit met `sqlcmd -I` (zie Schema aanmaken) |
+| `QUOTED_IDENTIFIER`-fout bij indexes | Voeg `-I` toe aan het `sqlcmd`-commando |
 | Staging-map niet gevonden | Controleer `STAGING_DIR` in `.env`; standaard is `./Staging` (hoofdletter S) |
-| Schema `MovieRecordsDW` bestaat niet | Voer `sql/create_tables.sql` uit op de database |
-| Verbinding mislukt | Controleer `DB_HOST` en `DB_PASSWORD` in `.env`; test met `python check_db.py` |
 | FK-fout bij feitentabellen | Dimensies moeten volledig geladen zijn vóór `FactRating`/`FactPrincipal` |
 | `KeyError` bij transform | Kolom ontbreekt in kolomselectie `transform.py`; zet `LOG_LEVEL=DEBUG` voor details |
 | Feitentabellen leeg na ETL | `LOG_LEVEL=DEBUG` toont FK-lookup statistieken en het aantal NULL-waarden per kolom |

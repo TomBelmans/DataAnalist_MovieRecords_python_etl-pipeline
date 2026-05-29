@@ -14,20 +14,23 @@ load_dotenv()
 
 # ── Database configuratie ────────────────────────────────────────────────────
 
+DB_AUTH: str = os.getenv("DB_AUTH", "sql").lower()
+
 DB_CONFIG: dict = {
-    "host":     os.getenv("DB_HOST"),
-    "port":     int(os.getenv("DB_PORT", 5432)),
-    "dbname":   os.getenv("DB_NAME", "postgres"),
-    "user":     os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD"),
-    # Verbindingstimeout in seconden
-    "connect_timeout": 10,  # seconden
-    # Docker gebruikt standaard 5432
+    "host":            os.getenv("DB_HOST"),
+    "port":            int(os.getenv("DB_PORT", 1433)),
+    "dbname":          os.getenv("DB_NAME", "MovieRecordsDW"),
+    "auth":            DB_AUTH,
+    "connect_timeout": 10,
 }
+
+if DB_AUTH == "sql":
+    DB_CONFIG["user"]     = os.getenv("DB_USER", "sa")
+    DB_CONFIG["password"] = os.getenv("DB_PASSWORD")
 
 # ── Database schema ──────────────────────────────────────────────────────────
 
-DB_SCHEMA: str = os.getenv("DB_SCHEMA", "MovieRecordsDW")
+DB_SCHEMA: str = os.getenv("DB_SCHEMA", "dbo")
 
 # ── Bestandspaden ────────────────────────────────────────────────────────────
 
@@ -49,10 +52,12 @@ logging.basicConfig(
 
 def validate_config() -> None:
     """Controleer of alle verplichte omgevingsvariabelen aanwezig zijn."""
-    required = ["DB_HOST", "DB_PASSWORD"]
+    required = ["DB_HOST"]
+    if DB_AUTH == "sql":
+        required.append("DB_PASSWORD")
     missing = [var for var in required if not os.getenv(var)]
     if missing:
         raise EnvironmentError(
             f"Ontbrekende omgevingsvariabelen: {', '.join(missing)}\n"
-            "Kopieer .env naar je eigen waarden en vul Docker-gegevens in."
+            "Vul de juiste waarden in .env in."
         )

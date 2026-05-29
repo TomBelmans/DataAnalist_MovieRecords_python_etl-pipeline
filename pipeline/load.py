@@ -1,54 +1,48 @@
-"""
-load.py – SCD-2 laadfuncties voor alle dimensie- en feit-tabellen.
-
-Aanpak (identiek aan SSIS SCD-2 Wizard):
-  1.  Haal huidig actieve rijen op uit de doeltabel (RowEndDate IS NULL).
-  2.  Vergelijk met bron op business-key.
-  3.  NIEUWE rijen  → INSERT (RowStartDate = now, RowEndDate = NULL).
-  4.  GEWIJZIGDE rijen → UPDATE RowEndDate = now  +  INSERT nieuwe versie.
-  5.  ONGEWIJZIGDE rijen → niets doen.
-
-Voor feit-tabellen (FactRating, FactPrincipal) wordt een eenvoudige
-truncate-and-reload gebruikt, want facts zijn afleidbaar en kennen
-geen historiek.
-"""
-
 import logging
 from datetime import date, datetime
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_values
+import pyodbc
 
 from . import config as cfg
 
 logger = logging.getLogger(__name__)
 
-# Schema-prefix voor alle tabelnamen (configureerbaar via .env DB_SCHEMA)
 _SCHEMA = cfg.DB_SCHEMA
 
 
 # ── Verbinding ───────────────────────────────────────────────────────────────
 
-def get_connection(db_config: dict) -> psycopg2.extensions.connection:
-    """Maak een nieuwe psycopg2-verbinding aan."""
-    return psycopg2.connect(**db_config)
+def get_connection(db_config: dict) -> pyodbc.Connection:
+    """Maak een nieuwe pyodbc-verbinding met SQL Server aan."""
+    host = db_config['host']
+    server = host if host.startswith('lpc:') else f"{host},{db_config['port']}"
+    base = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};"
+        f"DATABASE={db_config['dbname']};"
+        f"TrustServerCertificate=yes;"
+        f"Connection Timeout={db_config.get('connect_timeout', 10)};"
+    )
+    if db_config.get("auth") == "windows":
+        conn_str = base + "Trusted_Connection=yes;"
+    else:
+        conn_str = base + f"UID={db_config['user']};PWD={db_config['password']};"
+    return pyodbc.connect(conn_str)
 
 
 # ── Hulpfuncties ─────────────────────────────────────────────────────────────
 
 def _quoted(name: str) -> str:
-    """Zet een kolomnaam tussen aanhalingstekens (PostgreSQL)."""
-    return f'"{name}"'
+    """Zet een kolomnaam tussen vierkante haken (SQL Server)."""
+    return f"[{name}]"
 
 
 def _to_python_value(value: Any) -> Any:
     """
-    Zet pandas/numpy-waarden om naar native Python-types voor psycopg2.
-
-    psycopg2 kent geen numpy.int64, pandas NA, enz.
+    Zet pandas/numpy-waarden om naar native Python-types voor pyodbc.
     """
     if pd.isna(value):
         return None
@@ -68,27 +62,29 @@ def _to_python_value(value: Any) -> Any:
 def _fetch_active(cur, table: str, columns: list[str]) -> pd.DataFrame:
     """Haal alle actief actieve rijen op (RowEndDate IS NULL)."""
     cols = ", ".join(_quoted(c) for c in columns)
-    cur.execute(f'SELECT {cols} FROM "{_SCHEMA}"."{table}" WHERE "RowEndDate" IS NULL')
+    cur.execute(f"SELECT {cols} FROM [{_SCHEMA}].[{table}] WHERE [RowEndDate] IS NULL")
     rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame.from_records(rows, columns=columns)
 
 
 def _bulk_insert(cur, table: str, columns: list[str], df: pd.DataFrame) -> int:
     """
-    Voeg rijen in via psycopg2 execute_values (veel sneller dan row-by-row).
+    Voeg rijen in via pyodbc executemany met fast_executemany.
     Geeft het aantal ingevoegde rijen terug.
     """
     if df.empty:
         return 0
 
-    cols = ", ".join(_quoted(c) for c in columns)
-    sql  = f'INSERT INTO "{_SCHEMA}"."{table}" ({cols}) VALUES %s'
+    cols         = ", ".join(_quoted(c) for c in columns)
+    placeholders = ", ".join(["?" for _ in columns])
+    sql          = f"INSERT INTO [{_SCHEMA}].[{table}] ({cols}) VALUES ({placeholders})"
 
     records = [
         tuple(_to_python_value(v) for v in row)
         for row in df[columns].itertuples(index=False, name=None)
     ]
-    execute_values(cur, sql, records, page_size=1000)
+    cur.fast_executemany = True
+    cur.executemany(sql, records)
     return len(records)
 
 
@@ -99,13 +95,14 @@ def _expire_rows(cur, table: str, sk_col: str, sk_values: list[Any], now: dateti
     """
     if not sk_values:
         return 0
+    placeholders = ",".join(["?" for _ in sk_values])
     sql = f"""
-        UPDATE "{_SCHEMA}"."{table}"
-        SET    "RowEndDate" = %s
-        WHERE  "{sk_col}" = ANY(%s)
-          AND  "RowEndDate" IS NULL
+        UPDATE [{_SCHEMA}].[{table}]
+        SET    [RowEndDate] = ?
+        WHERE  [{sk_col}] IN ({placeholders})
+          AND  [RowEndDate] IS NULL
     """
-    cur.execute(sql, (now, sk_values))
+    cur.execute(sql, [now] + sk_values)
     return cur.rowcount
 
 
@@ -119,12 +116,13 @@ def load_scd2(
     tracked_cols: list[str],
     source_df: pd.DataFrame,
     now: datetime,
+    chunk_size: int = 50_000,
 ) -> dict:
     """
     Generieke SCD-2 laadfunctie voor dimensietabellen.
 
     Args:
-        conn:          Open psycopg2-verbinding.
+        conn:          Open pyodbc-verbinding.
         table:         Naam van de doeltabel (bv. 'DimMovie').
         sk_col:        Naam van de surrogate key (bv. 'movie_sk').
         business_keys: Kolom(men) die een record uniek identificeren in de bron.
@@ -135,7 +133,7 @@ def load_scd2(
     Returns:
         Dict met statistieken: {'new': int, 'changed': int, 'unchanged': int}
     """
-    all_cols = business_keys + tracked_cols
+    all_cols   = business_keys + tracked_cols
     fetch_cols = [sk_col] + all_cols
 
     with conn.cursor() as cur:
@@ -144,34 +142,30 @@ def load_scd2(
         stats = {"new": 0, "changed": 0, "unchanged": 0}
 
         if existing_df.empty:
-            # Initiële lading – alles is nieuw
             insert_cols = all_cols + ["RowStartDate", "RowEndDate"]
-            stats["new"] = _bulk_insert(cur, table, insert_cols, source_df)
-            conn.commit()
+            for start in range(0, len(source_df), chunk_size):
+                chunk = source_df.iloc[start : start + chunk_size]
+                stats["new"] += _bulk_insert(cur, table, insert_cols, chunk)
+                conn.commit()
+                logger.debug("%s – %d / %d rijen geladen", table, stats["new"], len(source_df))
             logger.info(
                 "%s – initiële lading: %d rijen ingevoegd", table, stats["new"]
             )
             return stats
 
         # ── Stap 2: Vergelijk bron met bestaande rijen ────────────────────
-        # Alles naar string voor typeongevoelige vergelijking (Int64 vs int, None vs NaN)
         src = source_df[all_cols].copy().astype(str).fillna("")
         tgt = existing_df[all_cols].copy().astype(str).fillna("")
 
-        # Left join: bronrijen zonder match in de doeltabel zijn nieuw
         merged = src.merge(
             existing_df[[sk_col] + business_keys],
             on=business_keys,
             how="left",
         )
 
-        # Nieuwe rijen: geen match gevonden in doeltabel
-        is_new = merged[sk_col].isna()
+        is_new      = merged[sk_col].isna()
         new_records = source_df[is_new.values].copy()
 
-        # Inner join op business keys: geeft alleen rijen die al bestaan.
-        # existing_merged = huidige DB-waarden, src_matched = nieuwe bronwaarden,
-        # beide op dezelfde volgorde zodat kolom-voor-kolom vergelijking klopt.
         existing_merged = tgt.merge(
             existing_df[[sk_col] + business_keys],
             on=business_keys,
@@ -203,9 +197,9 @@ def load_scd2(
         stats["changed"] = _expire_rows(cur, table, sk_col, changed_sks, now)
 
         # ── Stap 4: Invoegen van nieuwe + gewijzigde rijen ────────────────
-        to_insert = pd.concat([new_records, changed_recs], ignore_index=True)
+        to_insert   = pd.concat([new_records, changed_recs], ignore_index=True)
         insert_cols = all_cols + ["RowStartDate", "RowEndDate"]
-        inserted = _bulk_insert(cur, table, insert_cols, to_insert)
+        inserted    = _bulk_insert(cur, table, insert_cols, to_insert)
         stats["new"] = inserted - stats["changed"]
 
         stats["unchanged"] = len(source_df) - inserted
@@ -223,7 +217,7 @@ def load_scd2(
 def _fetch_existing_keys(cur, table: str, business_keys: list[str]) -> set:
     """Haal bestaande business keys op als tuples."""
     cols = ", ".join(_quoted(c) for c in business_keys)
-    cur.execute(f'SELECT {cols} FROM "{_SCHEMA}"."{table}"')
+    cur.execute(f"SELECT {cols} FROM [{_SCHEMA}].[{table}]")
     if len(business_keys) == 1:
         return {row[0] for row in cur.fetchall()}
     return {tuple(row) for row in cur.fetchall()}
@@ -241,21 +235,22 @@ def load_dimension_static(
     """
     Laad een dimensie zonder SCD-2 (DimDate, DimCountry).
 
-    Standaard: alleen nieuwe business keys invoegen (geen TRUNCATE), zodat
+    Standaard: alleen nieuwe business keys invoegen (geen DELETE), zodat
     bestaande foreign keys in feit-tabellen intact blijven.
 
-    Met force_reload=True: TRUNCATE ... CASCADE (verwijdert ook afhankelijke
-    feit-tabellen — alleen gebruiken bij bewuste volledige herlading).
+    Met force_reload=True: DELETE + IDENTITY RESEED (verwijdert ook afhankelijke
+    feit-rijen via ON DELETE CASCADE — alleen gebruiken bij bewuste volledige herlading).
     """
     total = 0
     with conn.cursor() as cur:
         if force_reload:
             logger.warning(
-                "%s – TRUNCATE CASCADE: verwijdert ook tabellen met FK naar %s",
-                table, table,
+                "%s – DELETE + RESEED: verwijdert alle rijen en reset identity",
+                table,
             )
+            cur.execute(f"DELETE FROM [{_SCHEMA}].[{table}]")
             cur.execute(
-                f'TRUNCATE TABLE "{_SCHEMA}"."{table}" RESTART IDENTITY CASCADE'
+                f"DBCC CHECKIDENT ('[{_SCHEMA}].[{table}]', RESEED, 0)"
             )
             to_load = source_df
         else:
@@ -303,7 +298,7 @@ def load_fact_truncate_insert(
     total = 0
     with conn.cursor() as cur:
         logger.info("%s – tabel leegmaken ...", table)
-        cur.execute(f'TRUNCATE TABLE "{_SCHEMA}"."{table}" RESTART IDENTITY CASCADE')
+        cur.execute(f"TRUNCATE TABLE [{_SCHEMA}].[{table}]")
 
         for start in range(0, len(source_df), chunk_size):
             chunk = source_df.iloc[start : start + chunk_size]
@@ -322,19 +317,15 @@ def fetch_sk_map(
 ) -> dict:
     """
     Lees een {key_col → sk_col}-woordenboek uit de doeltabel.
-    Gebruikt voor het oplossen van foreign keys vóór het laden van afhankelijke tabellen.
 
     Args:
         scd2: True = alleen actieve rijen (RowEndDate IS NULL).
               False = alle rijen (DimDate, DimCountry).
-
-    Voorbeeld:
-        movie_sk_map = fetch_sk_map(conn, 'DimMovie', 'movie_sk', 'tconst')
     """
-    where = ' WHERE "RowEndDate" IS NULL' if scd2 else ""
+    where = " WHERE [RowEndDate] IS NULL" if scd2 else ""
     with conn.cursor() as cur:
         cur.execute(
-            f'SELECT "{key_col}", "{sk_col}" FROM "{_SCHEMA}"."{table}"{where}'
+            f"SELECT [{key_col}], [{sk_col}] FROM [{_SCHEMA}].[{table}]{where}"
         )
         return {row[0]: row[1] for row in cur.fetchall()}
 
@@ -342,15 +333,10 @@ def fetch_sk_map(
 def fetch_sk_map_composite(conn, table: str, sk_col: str, key_cols: list[str]) -> dict:
     """
     Lees een {tuple(key_cols) → sk_col}-woordenboek voor samengestelde sleutels.
-
-    Voorbeeld:
-        category_sk_map = fetch_sk_map_composite(
-            conn, 'DimCategory', 'category_sk', ['category', 'job']
-        )
     """
     cols = ", ".join(_quoted(c) for c in key_cols)
     with conn.cursor() as cur:
         cur.execute(
-            f'SELECT {cols}, "{sk_col}" FROM "{_SCHEMA}"."{table}" WHERE "RowEndDate" IS NULL'
+            f"SELECT {cols}, [{sk_col}] FROM [{_SCHEMA}].[{table}] WHERE [RowEndDate] IS NULL"
         )
         return {row[:-1]: row[-1] for row in cur.fetchall()}

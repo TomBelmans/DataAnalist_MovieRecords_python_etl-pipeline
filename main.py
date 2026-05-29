@@ -249,7 +249,7 @@ def run_pipeline(tables: list[str]) -> None:
 
     # ── Verbinding ────────────────────────────────────────────────────────────
     conn = get_connection(cfg.DB_CONFIG)
-    logger.info("Verbonden met PostgreSQL: %s", cfg.DB_CONFIG["host"])
+    logger.info("Verbonden met SQL Server: %s", cfg.DB_CONFIG["host"])
 
     try:
         for table in ALL_TABLES:
